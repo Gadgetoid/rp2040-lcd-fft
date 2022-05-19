@@ -290,6 +290,8 @@ int main() {
         for (auto i = MIN_SAMPLE; i < (NUM_SAMPLES / 2u); i++) {
             if(i >= WIDTH) break; // Don't draw off the right edge of the screen
             int height = fix15_to_int(multiply_fix15(fr[i], int_to_fix15(144u)));
+            int c = std::min(height, 255);
+            lcd.set_pen(c, 0, 255 - c);
             lcd.line(Point(i, HEIGHT), Point(i, HEIGHT - height));
         }
 
