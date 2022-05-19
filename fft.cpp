@@ -17,6 +17,7 @@
 #include <math.h>
 
 #include "libraries/generic_st7789/generic_st7789.hpp"
+#include "drivers/button/button.hpp"
 
 #include "pico/stdlib.h"
 
@@ -25,6 +26,8 @@
 #include "hardware/adc.h"
 #include "hardware/irq.h"
 
+using namespace pimoroni;
+
 // Helpers for 16.15 fixed-point arithmetic
 typedef signed int fix15;
 constexpr __always_inline fix15 multiply_fix15(fix15 a, fix15 b) {return (fix15)(((signed long long)(a) * (signed long long)(b)) >> 15);}
@@ -32,6 +35,15 @@ constexpr __always_inline fix15 float_to_fix15(float a) {return (fix15)(a * 3276
 constexpr __always_inline float fix15_to_float(fix15 a) {return (float)(a) / 32768.0f;}
 constexpr __always_inline fix15 int_to_fix15(int a) {return (fix15)(a << 15);}
 constexpr __always_inline int fix15_to_int(fix15 a) {return (int)(a >> 15);}
+
+enum DisplayStyle {
+    WATERFALL,  // Waterfall style false colour, good view of frequencies, shows harmonics really nicely
+    BAR         // Bar graph shows transients and gives a better visual idea of amplitude at frequencies
+};
+
+DisplayStyle display_style = WATERFALL;
+
+Button button_a(12);
 
 // ADC
 const uint ADC_CHAN = 0;
@@ -42,7 +54,7 @@ const uint NUM_SAMPLES = 512u; // Must be a power of 2
 const uint MIN_SAMPLE = 5u;    // The very low frequencies contain erroneous high-amplitude values
 const unsigned int LOG2_NUM_SAMPLES = log2(NUM_SAMPLES);  // log2 non constexpr :/
 const unsigned int SHIFT_AMOUNT = (16u - LOG2_NUM_SAMPLES);
-constexpr float Fs = 20000.0f;
+constexpr float Fs = 10000.0f;
 constexpr float ADCCLK = 48000000.0f;
 constexpr float PI_X2 = M_PI * 2.0f;
 
@@ -59,9 +71,27 @@ fix15 SINE_TABLE[NUM_SAMPLES]; // a table of sines for the FFT
 fix15 FILTER_WINDOW[NUM_SAMPLES]; // a table of window values for the FFT
 
 
-uint8_t *sample_address_pointer = &sample_array[0];
+uint8_t *sample_address_pointer = sample_array;
 
-using namespace pimoroni;
+
+const Pen FALSE_COLOR_MAP[] = {
+    0x0820, 0x1020, 0x1021, 0x1021, 0x1821, 0x1821, 0x1821, 0x1821, 0x2021, 0x2022, 0x2022, 0x2022, 0x2822, 0x2822, 0x2822, 0x2822,
+    0x3022, 0x3022, 0x3023, 0x3023, 0x3823, 0x3823, 0x3803, 0x3803, 0x3803, 0x4003, 0x4003, 0x4003, 0x4003, 0x4003, 0x4803, 0x4804,
+    0x4804, 0x4804, 0x4804, 0x5004, 0x5004, 0x5004, 0x5004, 0x5004, 0x5804, 0x5804, 0x5804, 0x5804, 0x5804, 0x6004, 0x6004, 0x6004,
+    0x6004, 0x6004, 0x6804, 0x6804, 0x6805, 0x6805, 0x6805, 0x7005, 0x7005, 0x7005, 0x7005, 0x7005, 0x7805, 0x7805, 0x7805, 0x7804,
+    0x7804, 0x7804, 0x8024, 0x8024, 0x8024, 0x8024, 0x8024, 0x8824, 0x8844, 0x8844, 0x8844, 0x8864, 0x8864, 0x9064, 0x9064, 0x9084,
+    0x9084, 0x9084, 0x9084, 0x98a3, 0x98a3, 0x98a3, 0x98c3, 0x98c3, 0x98c3, 0xa0c3, 0xa0e3, 0xa0e3, 0xa0e3, 0xa0e2, 0xa102, 0xa902,
+    0xa902, 0xa922, 0xa922, 0xa922, 0xa922, 0xa942, 0xb141, 0xb141, 0xb161, 0xb161, 0xb161, 0xb161, 0xb181, 0xb981, 0xb981, 0xb9a0,
+    0xb9a0, 0xb9a0, 0xb9a0, 0xb9c0, 0xb9c0, 0xc1c0, 0xc1e0, 0xc1e0, 0xc1ef, 0xc1ef, 0xc20f, 0xc20f, 0xc20f, 0xca2f, 0xca2f, 0xca2f,
+    0xca2e, 0xca4e, 0xca4e, 0xca4e, 0xca4e, 0xd26e, 0xd26e, 0xd26e, 0xd28e, 0xd28d, 0xd28d, 0xd28d, 0xd2ad, 0xd2ad, 0xd2ad, 0xdacd,
+    0xdacd, 0xdacd, 0xdacc, 0xdaec, 0xdaec, 0xdaec, 0xdb0c, 0xdb0c, 0xdb0c, 0xe32c, 0xe32c, 0xe32c, 0xe32b, 0xe34b, 0xe34b, 0xe34b,
+    0xe36b, 0xe36b, 0xe36b, 0xeb8b, 0xeb8b, 0xeb8a, 0xeb8a, 0xebaa, 0xebaa, 0xebaa, 0xebca, 0xebca, 0xebca, 0xebea, 0xebe9, 0xebe9,
+    0xf409, 0xf409, 0xf409, 0xf429, 0xf429, 0xf429, 0xf429, 0xf448, 0xf448, 0xf448, 0xf468, 0xf468, 0xf468, 0xf488, 0xf488, 0xf488,
+    0xfca8, 0xfca7, 0xfcc7, 0xfcc7, 0xfcc7, 0xfce7, 0xfce7, 0xfce7, 0xfd07, 0xfd07, 0xfd06, 0xfd26, 0xfd26, 0xfd26, 0xfd46, 0xfd46,
+    0xfd66, 0xfd66, 0xfd66, 0xfd86, 0xfd85, 0xfd85, 0xfda5, 0xfda5, 0xfdc5, 0xfdc5, 0xfdc5, 0xfde5, 0xfde5, 0xfe05, 0xfe05, 0xfe05,
+    0xfe24, 0xfe24, 0xfe24, 0xfe44, 0xfe44, 0xfe64, 0xfe64, 0xfe84, 0xfe84, 0xfe84, 0xfea4, 0xfea4, 0xfec4, 0xfec4, 0xfec4, 0xfee4,
+    0xfee4, 0xf704, 0xf704, 0xf724, 0xf724, 0xf724, 0xf744, 0xf744, 0xf764, 0xf764, 0xf784, 0xf784, 0xf784, 0xf7a4, 0xf7a4, 0xefc4
+};
 
 const int WIDTH = 240;
 const int HEIGHT = 240;
@@ -238,9 +268,22 @@ int main() {
     // Start the ADC
     adc_run(true);
 
+    unsigned int y = 20u;
+
+    lcd.set_pen(BLACK);
+    lcd.clear();
+
     while(true) {
+        if(button_a.read()) {
+            display_style = display_style == WATERFALL ? BAR : WATERFALL;
+            y = 20u;
+        }
         lcd.set_pen(BLACK);
-        lcd.clear();
+        if(display_style == WATERFALL) {
+            lcd.rectangle(Rect(0, 0, WIDTH, 20));
+        } else {
+            lcd.clear();
+        }
 
         // Write some text
         lcd.set_pen(WHITE);
@@ -251,7 +294,7 @@ int main() {
         dma_channel_wait_for_finish_blocking(sample_chan);
 
         // Copy/window elements into a fixed-point array
-        for (int i=0; i<NUM_SAMPLES; i++) {
+        for (int i=0; i < NUM_SAMPLES; i++) {
             fr[i] = multiply_fix15(int_to_fix15((int)sample_array[i]), FILTER_WINDOW[i]);
             fi[i] = (fix15)0;
         }
@@ -288,12 +331,22 @@ int main() {
         lcd.text(freqtext, Point(160, 0), 240);
 
         for (auto i = MIN_SAMPLE; i < (NUM_SAMPLES / 2u); i++) {
-            if(i >= WIDTH) break; // Don't draw off the right edge of the screen
-            int height = fix15_to_int(multiply_fix15(fr[i], int_to_fix15(144u)));
-            int c = std::min(height, 255);
-            lcd.set_pen(c, 0, 255 - c);
-            lcd.line(Point(i, HEIGHT), Point(i, HEIGHT - height));
+            unsigned int x = i - MIN_SAMPLE;
+            if(x >= WIDTH) break; // Don't draw off the right edge of the screen
+            unsigned int height = fix15_to_int(multiply_fix15(fr[i], int_to_fix15(144u)));
+            uint8_t c = std::min(height, 255u);
+            lcd.set_pen(FALSE_COLOR_MAP[c]);
+            if(display_style == WATERFALL) {
+                lcd.pixel(Point(x, y));
+            }
+            else {
+                lcd.line(Point(x, HEIGHT), Point(x, HEIGHT - height));
+            }
         }
+        
+        y++;
+
+        if(y >= HEIGHT) y = 20u;
 
         lcd.update();
     }

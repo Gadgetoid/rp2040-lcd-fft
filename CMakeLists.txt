@@ -13,11 +13,12 @@ include(${PIMORONI_PICO_PATH}/drivers/st7789/st7789.cmake)
 include(${PIMORONI_PICO_PATH}/libraries/bitmap_fonts/bitmap_fonts.cmake)
 include(${PIMORONI_PICO_PATH}/libraries/pico_graphics/pico_graphics.cmake)
 include(${PIMORONI_PICO_PATH}/libraries/generic_st7789/generic_st7789.cmake)
+include(${PIMORONI_PICO_PATH}/drivers/button/button.cmake)
 
 add_executable(fft)
 
 target_sources(fft PRIVATE fft.cpp)
 
-target_link_libraries(fft PRIVATE pico_stdlib hardware_pio hardware_dma hardware_adc hardware_irq generic_st7789)
+target_link_libraries(fft PRIVATE pico_stdlib hardware_pio hardware_dma hardware_adc hardware_irq generic_st7789 button)
 
 pico_add_extra_outputs(fft)
