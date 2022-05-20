@@ -17,7 +17,7 @@ include(${PIMORONI_PICO_PATH}/drivers/button/button.cmake)
 
 add_executable(fft)
 
-target_sources(fft PRIVATE fft.cpp)
+target_sources(fft PRIVATE main.cpp fft.cpp)
 
 target_link_libraries(fft PRIVATE pico_stdlib hardware_pio hardware_dma hardware_adc hardware_irq generic_st7789 button)
 

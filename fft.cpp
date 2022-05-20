@@ -5,102 +5,8 @@
  * Original code in action:
  * https://www.youtube.com/watch?v=8aibPy4yzCk
  *
- * Resources Used
- *  - PIO state machines 0, 1, and 2 on PIO instance 0
- *  - DMA channels 0, 1, 2, and 3
- *  - ADC channel 0
- *
  */
-//#include "vga_graphics.h"
-#include <stdio.h>
-#include <stdlib.h>
-#include <math.h>
-
-#include "libraries/generic_st7789/generic_st7789.hpp"
-#include "drivers/button/button.hpp"
-
-#include "pico/stdlib.h"
-
-#include "hardware/pio.h"
-#include "hardware/dma.h"
-#include "hardware/adc.h"
-#include "hardware/irq.h"
-
-using namespace pimoroni;
-
-// Helpers for 16.15 fixed-point arithmetic
-typedef signed int fix15;
-constexpr __always_inline fix15 multiply_fix15(fix15 a, fix15 b) {return (fix15)(((signed long long)(a) * (signed long long)(b)) >> 15);}
-constexpr __always_inline fix15 float_to_fix15(float a) {return (fix15)(a * 32768.0f);}
-constexpr __always_inline float fix15_to_float(fix15 a) {return (float)(a) / 32768.0f;}
-constexpr __always_inline fix15 int_to_fix15(int a) {return (fix15)(a << 15);}
-constexpr __always_inline int fix15_to_int(fix15 a) {return (int)(a >> 15);}
-
-enum DisplayStyle {
-    WATERFALL,  // Waterfall style false colour, good view of frequencies, shows harmonics really nicely
-    BAR         // Bar graph shows transients and gives a better visual idea of amplitude at frequencies
-};
-
-DisplayStyle display_style = WATERFALL;
-
-Button button_a(12);
-
-// ADC
-const uint ADC_CHAN = 0;
-const uint ADC_PIN = 26;
-
-// Sample rate and depth
-const uint NUM_SAMPLES = 512u; // Must be a power of 2
-const uint MIN_SAMPLE = 5u;    // The very low frequencies contain erroneous high-amplitude values
-const unsigned int LOG2_NUM_SAMPLES = log2(NUM_SAMPLES);  // log2 non constexpr :/
-const unsigned int SHIFT_AMOUNT = (16u - LOG2_NUM_SAMPLES);
-constexpr float Fs = 10000.0f;
-constexpr float ADCCLK = 48000000.0f;
-constexpr float PI_X2 = M_PI * 2.0f;
-
-constexpr fix15 zero_point_4 = float_to_fix15(0.4f);
-
-// Here's where we'll have the DMA channel put ADC samples
-uint8_t sample_array[NUM_SAMPLES];
-
-// And here's where we'll copy those samples for FFT calculation
-fix15 fr[NUM_SAMPLES];
-fix15 fi[NUM_SAMPLES];
-
-fix15 SINE_TABLE[NUM_SAMPLES]; // a table of sines for the FFT
-fix15 FILTER_WINDOW[NUM_SAMPLES]; // a table of window values for the FFT
-
-
-uint8_t *sample_address_pointer = sample_array;
-
-
-const Pen FALSE_COLOR_MAP[] = {
-    0x0820, 0x1020, 0x1021, 0x1021, 0x1821, 0x1821, 0x1821, 0x1821, 0x2021, 0x2022, 0x2022, 0x2022, 0x2822, 0x2822, 0x2822, 0x2822,
-    0x3022, 0x3022, 0x3023, 0x3023, 0x3823, 0x3823, 0x3803, 0x3803, 0x3803, 0x4003, 0x4003, 0x4003, 0x4003, 0x4003, 0x4803, 0x4804,
-    0x4804, 0x4804, 0x4804, 0x5004, 0x5004, 0x5004, 0x5004, 0x5004, 0x5804, 0x5804, 0x5804, 0x5804, 0x5804, 0x6004, 0x6004, 0x6004,
-    0x6004, 0x6004, 0x6804, 0x6804, 0x6805, 0x6805, 0x6805, 0x7005, 0x7005, 0x7005, 0x7005, 0x7005, 0x7805, 0x7805, 0x7805, 0x7804,
-    0x7804, 0x7804, 0x8024, 0x8024, 0x8024, 0x8024, 0x8024, 0x8824, 0x8844, 0x8844, 0x8844, 0x8864, 0x8864, 0x9064, 0x9064, 0x9084,
-    0x9084, 0x9084, 0x9084, 0x98a3, 0x98a3, 0x98a3, 0x98c3, 0x98c3, 0x98c3, 0xa0c3, 0xa0e3, 0xa0e3, 0xa0e3, 0xa0e2, 0xa102, 0xa902,
-    0xa902, 0xa922, 0xa922, 0xa922, 0xa922, 0xa942, 0xb141, 0xb141, 0xb161, 0xb161, 0xb161, 0xb161, 0xb181, 0xb981, 0xb981, 0xb9a0,
-    0xb9a0, 0xb9a0, 0xb9a0, 0xb9c0, 0xb9c0, 0xc1c0, 0xc1e0, 0xc1e0, 0xc1ef, 0xc1ef, 0xc20f, 0xc20f, 0xc20f, 0xca2f, 0xca2f, 0xca2f,
-    0xca2e, 0xca4e, 0xca4e, 0xca4e, 0xca4e, 0xd26e, 0xd26e, 0xd26e, 0xd28e, 0xd28d, 0xd28d, 0xd28d, 0xd2ad, 0xd2ad, 0xd2ad, 0xdacd,
-    0xdacd, 0xdacd, 0xdacc, 0xdaec, 0xdaec, 0xdaec, 0xdb0c, 0xdb0c, 0xdb0c, 0xe32c, 0xe32c, 0xe32c, 0xe32b, 0xe34b, 0xe34b, 0xe34b,
-    0xe36b, 0xe36b, 0xe36b, 0xeb8b, 0xeb8b, 0xeb8a, 0xeb8a, 0xebaa, 0xebaa, 0xebaa, 0xebca, 0xebca, 0xebca, 0xebea, 0xebe9, 0xebe9,
-    0xf409, 0xf409, 0xf409, 0xf429, 0xf429, 0xf429, 0xf429, 0xf448, 0xf448, 0xf448, 0xf468, 0xf468, 0xf468, 0xf488, 0xf488, 0xf488,
-    0xfca8, 0xfca7, 0xfcc7, 0xfcc7, 0xfcc7, 0xfce7, 0xfce7, 0xfce7, 0xfd07, 0xfd07, 0xfd06, 0xfd26, 0xfd26, 0xfd26, 0xfd46, 0xfd46,
-    0xfd66, 0xfd66, 0xfd66, 0xfd86, 0xfd85, 0xfd85, 0xfda5, 0xfda5, 0xfdc5, 0xfdc5, 0xfdc5, 0xfde5, 0xfde5, 0xfe05, 0xfe05, 0xfe05,
-    0xfe24, 0xfe24, 0xfe24, 0xfe44, 0xfe44, 0xfe64, 0xfe64, 0xfe84, 0xfe84, 0xfe84, 0xfea4, 0xfea4, 0xfec4, 0xfec4, 0xfec4, 0xfee4,
-    0xfee4, 0xf704, 0xf704, 0xf724, 0xf724, 0xf724, 0xf744, 0xf744, 0xf764, 0xf764, 0xf784, 0xf784, 0xf784, 0xf7a4, 0xf7a4, 0xefc4
-};
-
-const int WIDTH = 240;
-const int HEIGHT = 240;
-
-ST7789Generic lcd(WIDTH, HEIGHT, false, nullptr, BG_SPI_FRONT);
-
-const Pen WHITE = lcd.create_pen(255, 255, 255);
-const Pen BLACK = lcd.create_pen(0, 0, 0);
-
+#include "fft.hpp"
 
 // Adapted from https://github.com/raspberrypi/pico-sdk/blob/master/src/host/pico_bit_ops/bit_ops.c
 uint16_t __always_inline __revs(uint16_t v) {
@@ -110,8 +16,119 @@ uint16_t __always_inline __revs(uint16_t v) {
     return ((v >> 8u) & 0x00ffu) | ((v & 0x00ffu) << 8u);
 }
 
-void FFT_fix15(fix15 fr[], fix15 fi[]) {
+int FFT::get_scaled(unsigned int i, unsigned int scale) {
+    return fix15_to_int(multiply_fix15(fr[i], int_to_fix15(scale)));
+}
 
+void FFT::init() {
+
+    // Populate Filter and Sine tables
+    for (auto ii = 0u; ii < sample_count; ii++) {
+        // Full sine wave with period NUM_SAMPLES
+        // Wolfram Alpha: Plot[(sin(2 * pi * (x / 1.0))), {x, 0, 1}]
+        sine_table[ii] = float_to_fix15(0.5f * sin((M_PI * 2.0f) * ((float) ii) / (float)sample_count));
+
+        // This is a crude approximation of a Lanczos window.
+        // Wolfram Alpha Comparison: Plot[0.5 * (1.0 - cos(2 * pi * (x / 1.0))), {x, 0, 1}], Plot[LanczosWindow[x - 0.5], {x, 0, 1}]
+        filter_window[ii] = float_to_fix15(0.5f * (1.0f - cos((M_PI * 2.0f) * ((float) ii) / ((float)sample_count))));
+    }
+
+
+
+
+    // ADC Configuration
+
+    // Init GPIO for analogue use: hi-Z, no pulls, disable digital input buffer.
+    adc_gpio_init(adc_pin);
+
+    // Initialize the ADC harware
+    // (resets it, enables the clock, spins until the hardware is ready)
+    adc_init();
+
+    // Select analog mux input (0...3 are GPIO 26, 27, 28, 29; 4 is temp sensor)
+    adc_select_input(adc_channel);
+
+    // Setup the FIFO
+    adc_fifo_setup(
+        true,    // Write each completed conversion to the sample FIFO
+        true,    // Enable DMA data request (DREQ)
+        1,       // DREQ (and IRQ) asserted when at least 1 sample present
+        false,   // We won't see the ERR bit because of 8 bit reads; disable.
+        true     // Shift each sample to 8 bits when pushing to FIFO
+    );
+
+    // Divisor of 0 -> full speed. Free-running capture with the divider is
+    // equivalent to pressing the ADC_CS_START_ONCE button once per `div + 1`
+    // cycles (div not necessarily an integer). Each conversion takes 96
+    // cycles, so in general you want a divider of 0 (hold down the button
+    // continuously) or > 95 (take samples less frequently than 96 cycle
+    // intervals). This is all timed by the 48 MHz ADC clock.
+    adc_set_clkdiv(48000000.0f / sample_rate);
+
+    // DMA Configuration
+
+    dma_channel_config dma_config = dma_channel_get_default_config(dma_channel);
+
+    // Reading from constant address, writing to incrementing byte addresses
+    channel_config_set_transfer_data_size(&dma_config, DMA_SIZE_8);
+    channel_config_set_read_increment(&dma_config, false);
+    channel_config_set_write_increment(&dma_config, true);
+
+    // Pace transfers based on availability of ADC samples
+    channel_config_set_dreq(&dma_config, DREQ_ADC);
+
+    dma_channel_configure(dma_channel,
+        &dma_config,    // channel config
+        sample_array,   // destination
+        &adc_hw->fifo,  // source
+        sample_count,   // transfer count
+        true            // start immediately
+    );
+
+    adc_run(true);
+}
+
+void FFT::update() {
+    float max_freq = 0;
+
+    // Wait for NUM_SAMPLES samples to be gathered
+    // Measure wait time with timer
+    dma_channel_wait_for_finish_blocking(dma_channel);
+
+    // Copy/window elements into a fixed-point array
+    for (int i=0; i < sample_count; i++) {
+        fr[i] = multiply_fix15(int_to_fix15((int)sample_array[i]), filter_window[i]);
+        fi[i] = (fix15)0;
+    }
+
+    // Restart the sample channel, now that we have our copy of the samples
+    dma_channel_set_write_addr(dma_channel, sample_array, true);
+
+    // Compute the FFT
+    FFT_fix15(fr, fi);
+
+    // Find the magnitudes
+    for (auto i = 0u; i < (sample_count / 2u); i++) {  
+        // get the approx magnitude
+        fr[i] = abs(fr[i]); //>>9
+        fi[i] = abs(fi[i]);
+        // reuse fr to hold magnitude
+        fr[i] = std::max(fr[i], fi[i]) + 
+                multiply_fix15(std::min(fr[i], fi[i]), float_to_fix15(0.4f)); 
+
+        // Keep track of maximum
+        if (fr[i] > max_freq && i >= 5u) {
+            max_freq = FFT::fr[i];
+            max_freq_dex = i;
+        }
+    }
+}
+
+float FFT::max_frequency() {
+    return max_freq_dex * (sample_rate / sample_count);
+}
+
+void FFT::FFT_fix15(fix15 fr[], fix15 fi[]) {
     // Bit Reversal Permutation
     // Bit reversal code below originally based on that found here: 
     // https://graphics.stanford.edu/~seander/bithacks.html#BitReverseObvious
@@ -119,8 +136,8 @@ void FFT_fix15(fix15 fr[], fix15 fi[]) {
     // Detail here: https://vanhunteradams.com/FFT/FFT.html#Single-point-transforms-(reordering)
     //
     // PH: Converted to stdlib functions and __revs so it doesn't hurt my eyes
-    for (auto m = 1u; m < NUM_SAMPLES - 1u; m++) {
-        auto mr = __revs(m) >> SHIFT_AMOUNT;
+    for (auto m = 1u; m < sample_count - 1u; m++) {
+        auto mr = __revs(m) >> shift_amount;
         // don't swap that which has already been swapped
         if (mr <= m) continue;
         // swap the bit-reveresed indices
@@ -137,20 +154,20 @@ void FFT_fix15(fix15 fr[], fix15 fi[]) {
     // PH: Moved variable declarations to first-use so types are visually explicit.
     // PH: Removed div 2 on sine table values, have computed the sine table pre-divided.
     int L = 1;
-    int k = LOG2_NUM_SAMPLES - 1;
+    int k = log2_samples - 1;
 
     // While the length of the FFT's being combined is less than the number of gathered samples
-    while (L < NUM_SAMPLES) {
+    while (L < sample_count) {
         // Determine the length of the FFT which will result from combining two FFT's
         int istep = L << 1;
         // For each element in the FFT's that are being combined
         for (auto m = 0u; m < L; ++m) { 
             // Lookup the trig values for that element
-            int j = m << k; // index into SINE_TABLE
-            fix15 wr =  SINE_TABLE[j + NUM_SAMPLES / 4];
-            fix15 wi = -SINE_TABLE[j];
+            int j = m << k; // index into sine_table
+            fix15 wr =  sine_table[j + sample_count / 4];
+            fix15 wi = -sine_table[j];
             // i gets the index of one of the FFT elements being combined
-            for (auto i = m; i < NUM_SAMPLES; i += istep) {
+            for (auto i = m; i < sample_count; i += istep) {
                 // j gets the index of the FFT element being combined with i
                 int j = i + L;
                 // compute the trig terms (bottom half of the above matrix)
@@ -168,186 +185,5 @@ void FFT_fix15(fix15 fr[], fix15 fi[]) {
         }
         --k;
         L = istep;
-    }
-}
-
-int main() {
-    // Initialize stdio
-    stdio_init_all();
-
-    lcd.set_backlight(255);
-
-    // ADC Configuration
-
-    // Init GPIO for analogue use: hi-Z, no pulls, disable digital input buffer.
-    adc_gpio_init(ADC_PIN);
-
-    // Initialize the ADC harware
-    // (resets it, enables the clock, spins until the hardware is ready)
-    adc_init();
-
-    // Select analog mux input (0...3 are GPIO 26, 27, 28, 29; 4 is temp sensor)
-    adc_select_input(ADC_CHAN);
-
-    // Setup the FIFO
-    adc_fifo_setup(
-        true,    // Write each completed conversion to the sample FIFO
-        true,    // Enable DMA data request (DREQ)
-        1,       // DREQ (and IRQ) asserted when at least 1 sample present
-        false,   // We won't see the ERR bit because of 8 bit reads; disable.
-        true     // Shift each sample to 8 bits when pushing to FIFO
-    );
-
-    // Divisor of 0 -> full speed. Free-running capture with the divider is
-    // equivalent to pressing the ADC_CS_START_ONCE button once per `div + 1`
-    // cycles (div not necessarily an integer). Each conversion takes 96
-    // cycles, so in general you want a divider of 0 (hold down the button
-    // continuously) or > 95 (take samples less frequently than 96 cycle
-    // intervals). This is all timed by the 48 MHz ADC clock. This is setup
-    // to grab a sample at 5kHz (48Mhz/5kHz - 1)
-    adc_set_clkdiv(ADCCLK / Fs);
-
-    // ADC DMA Configuration
-
-    // Channels
-    int sample_chan = 2;
-    int control_chan = 3;
-
-    // Channel configurations
-    dma_channel_config c2 = dma_channel_get_default_config(sample_chan);
-    dma_channel_config c3 = dma_channel_get_default_config(control_chan);
-
-    // ADC Sample Channel
-    // Reading from constant address, writing to incrementing byte addresses
-    channel_config_set_transfer_data_size(&c2, DMA_SIZE_8);
-    channel_config_set_read_increment(&c2, false);
-    channel_config_set_write_increment(&c2, true);
-    // Pace transfers based on availability of ADC samples
-    channel_config_set_dreq(&c2, DREQ_ADC);
-    // Configure the channel
-    dma_channel_configure(sample_chan,
-        &c2,            // channel config
-        sample_array,   // dst
-        &adc_hw->fifo,  // src
-        NUM_SAMPLES,    // transfer count
-        false           // start immediately
-    );
-
-    // Control Channel
-    channel_config_set_transfer_data_size(&c3, DMA_SIZE_32);  // 32-bit txfers
-    channel_config_set_read_increment(&c3, false);            // no read incrementing
-    channel_config_set_write_increment(&c3, false);           // no write incrementing
-    channel_config_set_chain_to(&c3, sample_chan);
-
-    dma_channel_configure(
-        control_chan,                         // Channel to be configured
-        &c3,                                  // The configuration we just created
-        &dma_hw->ch[sample_chan].write_addr,  // Write address (channel 0 read address)
-        &sample_address_pointer,              // Read address (POINTER TO AN ADDRESS)
-        1,                                    // Number of transfers, in this case each is 4 byte
-        false                                 // Don't start immediately.
-    );
-
-    // Filter and Sine tables
-
-    for (auto ii = 0u; ii < NUM_SAMPLES; ii++) {
-        // Full sine wave with period NUM_SAMPLES
-        // Wolfram Alpha: Plot[(sin(2 * pi * (x / 1.0))), {x, 0, 1}]
-        SINE_TABLE[ii] = float_to_fix15(0.5f * sin(PI_X2 * ((float) ii) / (float)NUM_SAMPLES));
-
-        // This is a crude approximation of a Lanczos window.
-        // Wolfram Alpha Comparison: Plot[0.5 * (1.0 - cos(2 * pi * (x / 1.0))), {x, 0, 1}], Plot[LanczosWindow[x - 0.5], {x, 0, 1}]
-        FILTER_WINDOW[ii] = float_to_fix15(0.5f * (1.0f - cos(PI_X2 * ((float) ii) / ((float)NUM_SAMPLES))));
-    }
-
-    printf("Starting capture...\n");
-
-    // Start the ADC channel
-    dma_start_channel_mask((1u << sample_chan));
-
-    // Start the ADC
-    adc_run(true);
-
-    unsigned int y = 20u;
-
-    lcd.set_pen(BLACK);
-    lcd.clear();
-
-    while(true) {
-        if(button_a.read()) {
-            display_style = display_style == WATERFALL ? BAR : WATERFALL;
-            y = 20u;
-        }
-        lcd.set_pen(BLACK);
-        if(display_style == WATERFALL) {
-            lcd.rectangle(Rect(0, 0, WIDTH, 20));
-        } else {
-            lcd.clear();
-        }
-
-        // Write some text
-        lcd.set_pen(WHITE);
-        lcd.text("Max freqency:", Point(0, 0), 240);
-    
-        // Wait for NUM_SAMPLES samples to be gathered
-        // Measure wait time with timer
-        dma_channel_wait_for_finish_blocking(sample_chan);
-
-        // Copy/window elements into a fixed-point array
-        for (int i=0; i < NUM_SAMPLES; i++) {
-            fr[i] = multiply_fix15(int_to_fix15((int)sample_array[i]), FILTER_WINDOW[i]);
-            fi[i] = (fix15)0;
-        }
-        float max_fr = 0;
-        int max_fr_dex = 0;
-
-        // Restart the sample channel, now that we have our copy of the samples
-        dma_channel_start(control_chan);
-
-        // Compute the FFT
-        FFT_fix15(fr, fi);
-
-        // Find the magnitudes
-        for (auto i = 0u; i < (NUM_SAMPLES / 2u); i++) {  
-            // get the approx magnitude
-            fr[i] = abs(fr[i]); //>>9
-            fi[i] = abs(fi[i]);
-            // reuse fr to hold magnitude
-            fr[i] = std::max(fr[i], fi[i]) + 
-                    multiply_fix15(std::min(fr[i], fi[i]), zero_point_4); 
-
-            // Keep track of maximum
-            if (fr[i] > max_fr && i >= MIN_SAMPLE) {
-                max_fr = fr[i];
-                max_fr_dex = i;
-            }
-        }
-
-        float max_freqency = max_fr_dex * (Fs / NUM_SAMPLES);
-        printf("%f\n", max_freqency);
-
-        char freqtext[40];
-        snprintf(freqtext, 40, "%d", (int)max_freqency);
-        lcd.text(freqtext, Point(160, 0), 240);
-
-        for (auto i = MIN_SAMPLE; i < (NUM_SAMPLES / 2u); i++) {
-            unsigned int x = i - MIN_SAMPLE;
-            if(x >= WIDTH) break; // Don't draw off the right edge of the screen
-            unsigned int height = fix15_to_int(multiply_fix15(fr[i], int_to_fix15(144u)));
-            uint8_t c = std::min(height, 255u);
-            lcd.set_pen(FALSE_COLOR_MAP[c]);
-            if(display_style == WATERFALL) {
-                lcd.pixel(Point(x, y));
-            }
-            else {
-                lcd.line(Point(x, HEIGHT), Point(x, HEIGHT - height));
-            }
-        }
-        
-        y++;
-
-        if(y >= HEIGHT) y = 20u;
-
-        lcd.update();
     }
 }
